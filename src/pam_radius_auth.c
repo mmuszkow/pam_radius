@@ -28,6 +28,7 @@
  * 1.3.16 - Miscellaneous fixes (see CVS for history)
  * 1.3.17 - Security fixes
  * 1.4.0 - bind to any open port, add add force_prompt, max_challenge, prompt options
+ * 1.4.1  - IPv6 support added
  *
  *
  *   This program is free software; you can redistribute it and/or modify
@@ -190,149 +191,189 @@ void _int_free(pam_handle_t * pamh, void *x, int error_status)
  *************************************************************************/
 
 /*
- * Return an IP address in host long notation from
- * one supplied in standard dot notation.
+ * Return a pointer to an IP address in sockaddr_storage form when given a
+ * host name, IPv4 address or IPv6 address, plus optional portstring.  Result is
+ * placed in a static structure (ssip), so the caller must copy the value
+ * out before this function gets called again.
  */
-static uint32_t ipstr2long(char *ip_str) {
-	char	buf[6];
-	char	*ptr;
-	int	i;
-	int	count;
-	uint32_t	ipaddr;
-	int	cur_byte;
+static struct sockaddr_storage * get_ipaddr(char *host, char *portstring) 
+{
+	static struct sockaddr_storage ssip;
+	struct addrinfo hintsaddr;
+	struct addrinfo *hostaddrs;
+	int rc;
 
-	ipaddr = (uint32_t)0;
-
-	for(i = 0;i < 4;i++) {
-		ptr = buf;
-		count = 0;
-		*ptr = '\0';
-
-		while(*ip_str != '.' && *ip_str != '\0' && count < 4) {
-			if (!isdigit((unsigned char)*ip_str)) {
-				return (uint32_t)0;
-			}
-			*ptr++ = *ip_str++;
-			count++;
-		}
-
-		if (count >= 4 || count == 0) {
-			return (uint32_t)0;
-		}
-
-		*ptr = '\0';
-		cur_byte = atoi(buf);
-		if (cur_byte < 0 || cur_byte > 255) {
-			return (uint32_t)0;
-		}
-
-		ip_str++;
-		ipaddr = ipaddr << 8 | (uint32_t)cur_byte;
+	if (!host) {
+		DPRINT(LOG_DEBUG, "DEBUG: get_ipaddr() called with NULL host pointer.\n");
+		return ((struct sockaddr_storage *) NULL);
 	}
-	return ipaddr;
-}
 
-/*
- * Check for valid IP address in standard dot notation.
- */
-static int good_ipaddr(char *addr) {
-	int dot_count;
-	int digit_count;
+	/* Resolve hostname into a valid IPv4 or IPv6 address.  Uses first address
+	   returned per discussion with Alan DeKok. */
+	memset(&hintsaddr, 0, sizeof(struct addrinfo));
+	hintsaddr.ai_family = AF_UNSPEC;
+	hintsaddr.ai_socktype = SOCK_DGRAM;
+	/* Considering whether AI_ADDRCONFIG should be set to scope addresses
+	 * to one IPv4 only or IPv6 only, or both, depending on whether this code
+	 * is running on a server with only IPv4 address, only IPv6 addresses, or
+	 * a mix of both.  Also considering whether AI_V4MAPPED should be set.
+	 * Neither is needed in testing thus far.  A future consideration.
+	 */
+	/* hintsaddr.ai_flags = (AI_V4MAPPED | AI_ADDRCONFIG); */
 
-	dot_count = 0;
-	digit_count = 0;
-	while(*addr != '\0' && *addr != ' ') {
-		if (*addr == '.') {
-			dot_count++;
-			digit_count = 0;
-		} else if (!isdigit((unsigned char)*addr)) {
-			dot_count = 5;
-		} else {
-			digit_count++;
-			if (digit_count > 3) {
-				dot_count = 5;
-			}
-		}
-		addr++;
+	if ((rc = getaddrinfo(host, portstring, &hintsaddr, &hostaddrs)) != 0) {
+		/* non-zero return code is error. */
+		DPRINT(LOG_DEBUG, "DEBUG: getaddrinfo('%s', '%s') returned %s.\n",
+			host, portstring, gai_strerror(rc));
+		return ((struct sockaddr_storage *) NULL);
 	}
-	if (dot_count != 3) {
-		return -1;
+
+	/* Format the address (numeric host) and port (numeric service) for debug */
+	char numHost[NI_MAXHOST], numService[NI_MAXSERV];
+	rc = getnameinfo((struct sockaddr *) hostaddrs->ai_addr, hostaddrs->ai_addrlen,
+		numHost, NI_MAXHOST, numService, NI_MAXSERV,
+		NI_NUMERICHOST | NI_NUMERICSERV);
+	if (rc == 0) {
+		DPRINT(LOG_DEBUG, "DEBUG: getaddrinfo('%s', '%s') resolved to '%s:%s'\n", host, portstring,
+			numHost, numService);
 	} else {
-		return 0;
+		DPRINT(LOG_DEBUG, "DEBUG: getnameinfo: %s\n", gai_strerror(rc));
 	}
+
+	/* Save result to local static variable, free getaddrinfo results, and return result */
+	memcpy(&ssip, hostaddrs->ai_addr, sizeof(struct sockaddr_storage));
+	freeaddrinfo(hostaddrs);
+	return (&ssip);
 }
 
 /*
- * Return an IP address in host long notation from a host
- * name or address in dot notation.
- */
-static uint32_t get_ipaddr(char *host) {
-	struct hostent *hp;
+ * host2server:  Convert server->hostname to server->ssip and server->port
+ *
+ * Given a pointer to a server structure which was created from a line in the
+ * server config file, parse the server's "hostname" string, which might be a
+ * "hostname:port" but is more likely an IPv4 or IPv6 address followed by a port.
+ * Parse apart the information and perform address resolution, using
+ * getaddrinfo().  The result is a sockaddr_storage structure that handles IPv4
+ * or IPv6.  The sockaddr_storage structure gets written back to the server's
+ * server->ssip field.  The server's port string is also converted into a port number
+ * and written back to the server's server->port field.
+ *
+ * IPv6 addresses have a variable number of colons, up to seven.
+ * The port string can be a name or value, but the port string is also optional.
+ * Instead of requiring that IPv6 addresses be written in the longer form that
+ * requires all seven colons (with intervening zeros), and instead of requiring
+ * that the port string always be provided, we chose a different rule.  IPv6
+ * addresses must be placed in square brackets.
+ *
+ * From /etc/raddb/server sample:
+ *   # Server can be a hostname string or an IP address.  The :port portion is optional.
+ *   # IPv6 addresses must be enclosed in square brackets [fdca:1:2::3:4].
+ *   #
+ *   # server{:port}                   shared_secret    timeout (seconds)
+ *   vm-ac-radius-ipv6:1812             testing123          4
+ *   192.168.42.63:1812                 testing123          3
+ *   [1111:2222:3333:4444::1:3]:1812    testing123          3
 
-	if (good_ipaddr(host) == 0) {
-		return ipstr2long(host);
-	} else if ((hp = gethostbyname(host)) == (struct hostent *)NULL) {
-		return (uint32_t)0;
-	}
-
-	return ntohl(*(uint32_t *)hp->h_addr);
-}
-
-/*
- * take server->hostname, and convert it to server->ip and server->port
  */
 static int host2server(radius_server_t *server)
 {
 	char *p;
-
-	if ((p = strchr(server->hostname, ':')) != NULL) {
-		*(p++) = '\0';		/* split the port off from the host name */
+	struct sockaddr_storage * ssipptr;
+	int PORTSTRING_LEN = 256;
+	char portstring[PORTSTRING_LEN];
+  
+	/*
+	 * Break down server->hostname into component parts: the hostname/ipaddress
+	 * and the port string, noting that ipv6 addresses must be surrounded by 
+	 * brackets to "escape/protect" the colons inside vs. the :port (optional)
+	 * at the right end.
+	 */
+	char *phost = server->hostname; /* start of unencumbered ipaddress or host. */
+	char *ppast = server->hostname; /* past protected [<ipv6-address>], if any. */
+	if (phost[0] == '[') {
+		*(phost++) = ' ';  /* space intentially. */
+		if ((ppast = strchr(phost, ']')) != NULL) {
+			*(ppast++) = '\0';
+		} else {
+			/* Nothing after the left-bracket - return early */
+			DPRINT(LOG_DEBUG, "DEBUG: host2server invalid server '%s'.\n", server->hostname);
+			return PAM_AUTHINFO_UNAVAIL;
+		}
 	}
 
-	if ((server->ip.s_addr = get_ipaddr(server->hostname)) == ((uint32_t)0)) {
-		DPRINT(LOG_DEBUG, "DEBUG: get_ipaddr(%s) returned 0.\n", server->hostname);
-		return PAM_AUTHINFO_UNAVAIL;
+	/* Find and split off ':port' string. */
+	p = NULL;
+	if (ppast) {
+		if ((p = strchr(ppast, ':')) != NULL) {
+			*(p++) = '\0'; /* split the port off from the host name */
+		}
 	}
 
 	/*
-	 *	If the server port hasn't already been defined, go get it.
+	 * The code above transforms the server->hostname buffer in place, and gives
+	 * us two pointers to null-terminated strings in the buffer.  Below are two
+	 * examples:
+	 *
+	 * For IPv4 or a name, from    192.168.42.63:1812 into 192.168.42.63\01812
+	 * For IPv6,           from    [fdca:2::8]:1812   into  fdca:2::8\0\01812
+	 *
+	 * where  phost  points into it to the null-terminated host string,
+	 * and    p      points into it to the null-terminated port string, 1812
+	 */
+
+	/*
+	 *  If the server port hasn't already been defined, go get it.
 	 */
 	if (!server->port) {
-		if (p && isdigit((unsigned char)*p)) {	/* the port looks like it's a number */
+		if (p && isdigit(*p)) { /* port string looks like it's a number */
 			unsigned int i = atoi(p) & 0xffff;
 
 			if (!server->accounting) {
-				server->port = htons((uint16_t) i);
+				server->port = htons((u_short) i);
 			} else {
-				server->port = htons((uint16_t) (i + 1));
+				server->port = htons((u_short) (i + 1));
 			}
-		} else {			/* the port looks like it's a name */
-			struct servent *svp;
+		} else { /* port string might be missing or might be a service name */
+			struct servent *svp = NULL;
 
-			if (p) {			/* maybe it's not "radius" */
-				svp = getservbyname (p, "udp");
-				/* quotes allow distinction from above, lest p be radius or radacct */
-				DPRINT(LOG_DEBUG, "DEBUG: getservbyname('%s', udp) returned %p.\n", p, svp);
-				*(--p) = ':';		/* be sure to put the delimiter back */
-			} else {
-				if (!server->accounting) {
-					svp = getservbyname ("radius", "udp");
-					DPRINT(LOG_DEBUG, "DEBUG: getservbyname(radius, udp) returned %p.\n", svp);
-				} else {
-					svp = getservbyname ("radacct", "udp");
-					DPRINT(LOG_DEBUG, "DEBUG: getservbyname(radacct, udp) returned %p.\n", svp);
+			if (p) {   /* port string is not missing, look it up, might not be "radius" */
+				if ((svp = getservbyname (p, "udp")) == NULL) {
+					return PAM_AUTHINFO_UNAVAIL;
 				}
-			}
-
-			if (svp == (struct servent *) 0) {
-				/* debugging above... */
-				return PAM_AUTHINFO_UNAVAIL;
+				/* if it's the accounting stage, need to adjust to accounting port. */
+				if (server->accounting) {
+					/* convert to host order, add one, convert back to network order */
+					svp->s_port = htons(ntohs(svp->s_port) + 1);
+				}
+			} else {   /* port string is missing, so look up radius or radacct */
+				if (!server->accounting) {
+					if ((svp = getservbyname ("radius", "udp")) == NULL) {
+						return PAM_AUTHINFO_UNAVAIL;
+					}
+				} else {
+					if ((svp = getservbyname ("radacct", "udp")) == NULL) {
+						return PAM_AUTHINFO_UNAVAIL;
+					}
+				}
 			}
 
 			server->port = svp->s_port;
 		}
 	}
 
+	/* Convert port back to a string for get_ipaddr / getaddrinfo calls. */
+	snprintf(portstring, PORTSTRING_LEN, "%hu", ntohs(server->port));
+
+	/* phost is the hostname or ipaddress string without optional :port, and with ipv6
+	 * brackets, if any, removed.
+	 */
+	if ((ssipptr = get_ipaddr(phost, portstring)) == NULL) {
+		DPRINT(LOG_DEBUG, "DEBUG: get_ipaddr('%s', '%s') returned 0.\n", server->hostname, portstring);
+		return PAM_AUTHINFO_UNAVAIL;
+	}
+
+	/* Save resolved address as sockaddr_storage into server's ssip field */
+	memcpy(&(server->ssip), ssipptr, sizeof(struct sockaddr_storage));
 	return PAM_SUCCESS;
 }
 
@@ -594,7 +635,7 @@ static void cleanup(radius_server_t *server)
  */
 static int initialize(radius_conf_t *conf, int accounting)
 {
-	struct sockaddr salocal;
+	struct sockaddr_in6 salocal6;
 	char hostname[BUFFER_SIZE];
 	char secret[BUFFER_SIZE];
 
@@ -602,7 +643,6 @@ static int initialize(radius_conf_t *conf, int accounting)
 	char *p;
 	FILE *fserver;
 	radius_server_t *server = NULL;
-	struct sockaddr_in * s_in;
 	int timeout;
 	int line = 0;
 	char src_ip[MAX_IP_LEN];
@@ -673,25 +713,32 @@ static int initialize(radius_conf_t *conf, int accounting)
 	}
 
 	/* open a socket.	Dies if it fails */
-	conf->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (conf->sockfd < 0) {
+	conf->sockfd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+	if (conf->sockfd <= 0) {
 		_pam_log(LOG_ERR, "Failed to open RADIUS socket: %s\n", strerror(errno));
 		return PAM_AUTHINFO_UNAVAIL;
 	}
 
-	/* set up the local end of the socket communications */
-	s_in = (struct sockaddr_in *) &salocal;
-	memset ((char *) s_in, '\0', sizeof(struct sockaddr));
-	s_in->sin_family = AF_INET;
-	if (!*src_ip) {
-		s_in->sin_addr.s_addr = INADDR_ANY;
-	} else {
-		if (!inet_aton(src_ip, (struct in_addr *) &(s_in->sin_addr.s_addr))) s_in->sin_addr.s_addr = INADDR_ANY;
+	/* Set option to allow socket to do both IPv4 and IPv6 communications. Some
+	 * OS's default this option to on, and some to off. It may vary depending
+	 * on the particular release number of an operating system.  Use the command
+	 *   $ sysctl  -a | grep ipv6.bindv6only
+	 *   net.ipv6.bindv6only = 0
+	 * to find a system's default value. However, we still force the setting.
+	 */
+	int no = 0;
+	if ((setsockopt(conf->sockfd, SOL_IPV6, IPV6_V6ONLY, &no, sizeof(no))) < 0) {
+		_pam_log(LOG_ERR, "Failure turning off IPV6_V6ONLY. setsockopt error: %s.", strerror(errno));
+		return PAM_AUTHINFO_UNAVAIL;
 	}
-	s_in->sin_port = 0;
-	
 
-	if (bind(conf->sockfd, &salocal, sizeof (struct sockaddr_in)) < 0) {
+	/* set up the local end of the socket communications */
+	memset ((char *) &salocal6, '\0', sizeof(struct sockaddr_in6));
+	salocal6.sin6_family = AF_INET6;
+	salocal6.sin6_addr = in6addr_any;
+	salocal6.sin6_port = htons(0);
+
+	if (bind(conf->sockfd, (struct sockaddr *) &salocal6, sizeof (struct sockaddr_in6)) < 0) {
 		_pam_log(LOG_ERR, "Failed binding to port: %s", strerror(errno));
 		close(conf->sockfd);
 		return PAM_AUTHINFO_UNAVAIL;
@@ -701,13 +748,33 @@ static int initialize(radius_conf_t *conf, int accounting)
 }
 
 /*
+ * The IP address for the client is placed in the RADIUS packet and tagged
+ * according to the type (IP for AF_INET, IPV6 for AF_INET6).
+ */
+static void add_ssip_attribute(AUTH_HDR *request, struct sockaddr_storage * ssipptr)
+{
+	switch (ssipptr->ss_family) {
+	case AF_INET:
+		add_attribute(request, PW_NAS_IP_ADDRESS,
+			(unsigned char *)&((struct sockaddr_in *)ssipptr)->sin_addr, 4);
+		break;
+	case AF_INET6:
+		add_attribute(request, PW_NAS_IPV6_ADDRESS,
+			(unsigned char *)&((struct sockaddr_in6 *)ssipptr)->sin6_addr, 16);
+		break;
+	default:
+		break;
+	}
+}
+
+/*
  * Helper function for building a radius packet.
  * It initializes *some* of the header, and adds common attributes.
  */
 static void build_radius_packet(AUTH_HDR *request, CONST char *user, CONST char *password, radius_conf_t *conf)
 {
 	char hostname[256];
-	uint32_t ipaddr;
+	struct sockaddr_storage * ssipptr;
 
 	hostname[0] = '\0';
 	gethostname(hostname, sizeof(hostname) - 1);
@@ -733,22 +800,13 @@ static void build_radius_packet(AUTH_HDR *request, CONST char *user, CONST char 
 		add_password(request, PW_PASSWORD, "", conf->server->secret);
 	}
 
-	/* the packet is from localhost if on localhost, to make configs easier */
-	if ((conf->server->ip.s_addr == ntohl(0x7f000001)) || (!hostname[0])) {
-		ipaddr = 0x7f000001;
-	} else {
-		struct hostent *hp;
-
-		if ((hp = gethostbyname(hostname)) == (struct hostent *) NULL) {
-			ipaddr = 0x00000000;	/* no client IP address */
-		} else {
-			ipaddr = ntohl(*(uint32_t *) hp->h_addr); /* use the first one available */
-		}
-	}
-
-	/* If we can't find an IP address, then don't add one */
-	if (ipaddr) {
-		add_int_attribute(request, PW_NAS_IP_ADDRESS, ipaddr);
+	/*
+	 * Convert this host's hostname into an ip address if possible.
+	 * When looking up this host's ip address, note that the port is not meaningful, hence "".
+	 * If we can't determine an IP address, then don't add one.
+	 */
+	if ((ssipptr = get_ipaddr(hostname, "")) != NULL) {
+		add_ssip_attribute(request, ssipptr);
 	}
 
 	/* There's always a NAS identifier */
@@ -778,8 +836,7 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 	struct timeval tv;
 	time_t now, end;
 	int rcode;
-	struct sockaddr saremote;
-	struct sockaddr_in *s_in = (struct sockaddr_in *) &saremote;
+	struct sockaddr_storage saremote;
 	radius_server_t *server = conf->server;
 	int ok;
 	int server_tries;
@@ -812,11 +869,6 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 			goto next;		/* skip to the next server */
 		}
 
-		/* set up per-server IP && port configuration */
-		memset ((char *) s_in, '\0', sizeof(struct sockaddr));
-		s_in->sin_family = AF_INET;
-		s_in->sin_addr.s_addr = htonl(server->ip.s_addr);
-		s_in->sin_port = server->port;
 		total_length = ntohs(request->length);
 
 		if (!password) { 		/* make an RFC 2139 p6 request authenticator */
@@ -825,9 +877,15 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 
 		server_tries = tries;
 	send:
+		if (server->ssip.ss_family == AF_INET) {
+			salen = sizeof (struct sockaddr_in);
+		} else {
+			salen = sizeof (struct sockaddr_in6);
+		}
+
 		/* send the packet */
 		if (sendto(conf->sockfd, (char *) request, total_length, 0,
-			   &saremote, sizeof(struct sockaddr_in)) < 0) {
+			((struct sockaddr *)&(server->ssip)), salen) < 0) {
 			_pam_log(LOG_ERR, "Error sending RADIUS packet to server %s: %s",
 				 server->hostname, strerror(errno));
 			ok = FALSE;
@@ -836,7 +894,7 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 
 		/* ************************************************************ */
 		/* Wait for the response, and verify it. */
-		salen = sizeof(struct sockaddr);
+		salen = sizeof(struct sockaddr_storage);
 		tv.tv_sec = server->timeout;	/* wait for the specified time */
 		tv.tv_usec = 0;
 		FD_ZERO(&set);			/* clear out the set */
@@ -889,7 +947,7 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 
 				/* try to receive some data */
 				if ((total_length = recvfrom(conf->sockfd, (void *) response, BUFFER_SIZE,
-						     	     0, &saremote, &salen)) < 0) {
+					0, (struct sockaddr *) &saremote, &salen)) < 0) {
 					_pam_log(LOG_ERR, "error reading RADIUS packet from server %s: %s",
 					 	 server->hostname, strerror(errno));
 					ok = FALSE;
@@ -900,7 +958,7 @@ static int talk_radius(radius_conf_t *conf, AUTH_HDR *request, AUTH_HDR *respons
 					char *p = server->secret;
 
 					if ((ntohs(response->length) != total_length) ||
-					    (ntohs(response->length) > BUFFER_SIZE)) {
+						(ntohs(response->length) > BUFFER_SIZE)) {
 						_pam_log(LOG_ERR, "RADIUS packet from server %s is corrupted",
 						 	 server->hostname);
 						ok = FALSE;

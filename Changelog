@@ -1,3 +1,10 @@
+1.4.1
+-----
+
+   IPv6 support added.
+
+   Based on a patch from Alan Carwile <alan.d.carwile@gmail.com>
+
 1.4.0
 -----
 
