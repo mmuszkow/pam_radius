@@ -36,6 +36,9 @@
 #  error security/pam_modules.h or pam/pam_modules.h required
 #endif
 
+#ifndef SOL_IPV6
+#  define SOL_IPV6    IPPROTO_IPV6
+#endif
 
 #include "radius.h"
 #include "md5.h"
